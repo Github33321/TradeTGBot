@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"net/http/cookiejar"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +14,13 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/gocolly/colly"
 	"github.com/joho/godotenv"
+)
+
+var (
+	jar *cookiejar.Jar
+
+	alerts      []Alert
+	alertsMutex sync.Mutex
 )
 
 // StockInfo содержит тикер, URL и красивое название акции.
@@ -35,11 +44,6 @@ type Alert struct {
 	Direction string  // "up" если ждём роста, "down" если ждём падения
 }
 
-var (
-	alerts      []Alert
-	alertsMutex sync.Mutex
-)
-
 // stocks — список доступных акций.
 var stocks = map[string]StockInfo{
 	"LKOH":     {"LKOH", "https://ru.investing.com/equities/lukoil_rts", "Лукойл"},
@@ -60,11 +64,11 @@ var stocks = map[string]StockInfo{
 	"BLNG":     {"BLNG", "https://ru.investing.com/equities/belon_rts", "Белон"},
 }
 
-// fetchStockData создает клон коллектора и извлекает данные со страницы:
-// название акции (из тега h1) и цену (из div[data-test="instrument-price-last"]).
 func fetchStockData(url string, baseCollector *colly.Collector) (StockData, error) {
 	var data StockData
 	collector := baseCollector.Clone()
+	collector.SetCookieJar(jar)
+
 	done := make(chan struct{})
 
 	collector.OnHTML("h1", func(e *colly.HTMLElement) {
@@ -75,7 +79,6 @@ func fetchStockData(url string, baseCollector *colly.Collector) (StockData, erro
 	collector.OnHTML(`div[data-test="instrument-price-last"]`, func(e *colly.HTMLElement) {
 		priceStr := strings.TrimSpace(e.Text)
 		if priceStr != "" {
-			// Удаляем пробелы, точки-разделители тысяч и заменяем запятую на точку.
 			priceStr = strings.ReplaceAll(priceStr, " ", "")
 			priceStr = strings.ReplaceAll(priceStr, ".", "")
 			priceStr = strings.ReplaceAll(priceStr, ",", ".")
@@ -103,7 +106,8 @@ func fetchStockData(url string, baseCollector *colly.Collector) (StockData, erro
 }
 
 func main() {
-	// Задайте токен вашего Telegram-бота (через переменную окружения или напрямую)
+	rand.Seed(time.Now().UnixNano())
+
 	errt := godotenv.Load()
 	if errt != nil {
 		log.Fatal("Error loading .env file")
@@ -113,31 +117,47 @@ func main() {
 		log.Fatal("BOT_TOKEN is not set in .env file")
 	}
 
-	// Создаем базовый Colly-коллектор с AllowURLRevisit и дополнительными заголовками.
+	var err error
+	jar, err = cookiejar.New(nil)
+	if err != nil {
+		log.Fatal("Ошибка создания cookie jar:", err)
+	}
+
 	baseCollector := colly.NewCollector(
-		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
-			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"),
 		colly.AllowURLRevisit(),
 	)
+	// Рандомизация заголовков
+	userAgents := []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:94.0) Gecko/20100101 Firefox/94.0",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+	}
+	referers := []string{
+		"https://ru.investing.com/",
+		"https://www.google.com/",
+		"https://yandex.ru/",
+	}
+
+	baseCollector.SetCookieJar(jar)
 	baseCollector.OnRequest(func(r *colly.Request) {
+		// Выбираем случайный User-Agent и Referer
+		r.Headers.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
+		r.Headers.Set("Referer", referers[rand.Intn(len(referers))])
 		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		r.Headers.Set("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
-		r.Headers.Set("Referer", "https://ru.investing.com/")
 		r.Headers.Set("Origin", "https://ru.investing.com")
-		log.Printf("Visiting %s", r.URL.String())
+		log.Printf("Visiting %s with User-Agent: %s", r.URL.String(), r.Headers.Get("User-Agent"))
 	})
 	baseCollector.OnError(func(r *colly.Response, err error) {
 		log.Printf("Ошибка запроса для %s: %v", r.Request.URL, err)
 	})
 
-	// Предварительный запрос для получения cookies.
-	err := baseCollector.Visit("https://ru.investing.com")
+	err = baseCollector.Visit("https://ru.investing.com")
 	if err != nil {
 		log.Printf("Предварительный запрос не удался: %v", err)
 	}
 	time.Sleep(2 * time.Second)
 
-	// Создаем Telegram-бота.
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Panic(err)
@@ -149,7 +169,6 @@ func main() {
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	// Горутинa для проверки оповещений (каждые 30 секунд).
 	go func() {
 		for {
 			alertsMutex.Lock()
@@ -159,7 +178,7 @@ func main() {
 				if !ok {
 					continue
 				}
-				stock, err := fetchStockData(stockInfo.URL, baseCollector.Clone())
+				stock, err := fetchStockData(stockInfo.URL, baseCollector)
 				if err != nil {
 					log.Printf("Ошибка проверки оповещения для %s: %v", alert.Ticker, err)
 					remaining = append(remaining, alert)
@@ -185,13 +204,10 @@ func main() {
 		}
 	}()
 
-	// Обработка входящих сообщений.
 	for update := range updates {
 		if update.Message == nil {
 			continue
 		}
-
-		// Обработка команды /start и /list.
 		if update.Message.IsCommand() {
 			switch update.Message.Command() {
 			case "start":
@@ -214,9 +230,7 @@ func main() {
 			continue
 		}
 
-		// Разбиваем входящее сообщение на токены.
 		tokens := strings.Fields(update.Message.Text)
-		// Если сообщение содержит два слова – создаем оповещение.
 		if len(tokens) == 2 {
 			ticker := strings.ToUpper(tokens[0])
 			target, err := strconv.ParseFloat(tokens[1], 64)
@@ -231,7 +245,6 @@ func main() {
 				bot.Send(msg)
 				continue
 			}
-			// Получаем текущую цену для определения направления.
 			stock, err := fetchStockData(info.URL, baseCollector)
 			if err != nil {
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Ошибка получения данных для %s: %v", ticker, err))
@@ -265,7 +278,6 @@ func main() {
 			continue
 		}
 
-		// Если сообщение содержит одно слово – обычный запрос цены.
 		if len(tokens) == 1 {
 			ticker := strings.ToUpper(strings.TrimSpace(update.Message.Text))
 			info, ok := stocks[ticker]
