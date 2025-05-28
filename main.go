@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"net/http/cookiejar"
 	"os"
 	"strconv"
@@ -23,28 +24,24 @@ var (
 	alertsMutex sync.Mutex
 )
 
-// StockInfo содержит тикер, URL и красивое название акции.
 type StockInfo struct {
 	Ticker string
 	URL    string
 	Name   string
 }
 
-// StockData хранит название акции и её актуальную цену.
 type StockData struct {
 	Name  string
 	Price float64
 }
 
-// Alert описывает оповещение для конкретной акции.
 type Alert struct {
-	Ticker    string  // например, "LKOH"
-	Target    float64 // цена-цель
-	ChatID    int64   // идентификатор чата
-	Direction string  // "up" если ждём роста, "down" если ждём падения
+	Ticker    string
+	Target    float64
+	ChatID    int64
+	Direction string
 }
 
-// stocks — список доступных акций.
 var stocks = map[string]StockInfo{
 	"LKOH":     {"LKOH", "https://ru.investing.com/equities/lukoil_rts", "Лукойл"},
 	"AEROFLOT": {"AEROFLOT", "https://ru.investing.com/equities/aeroflot", "Аэрофлот"},
@@ -68,7 +65,6 @@ func fetchStockData(url string, baseCollector *colly.Collector) (StockData, erro
 	var data StockData
 	collector := baseCollector.Clone()
 	collector.SetCookieJar(jar)
-
 	done := make(chan struct{})
 
 	collector.OnHTML("h1", func(e *colly.HTMLElement) {
@@ -108,10 +104,7 @@ func fetchStockData(url string, baseCollector *colly.Collector) (StockData, erro
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	errt := godotenv.Load()
-	if errt != nil {
-		log.Fatal("Error loading .env file")
-	}
+	_ = godotenv.Load()
 	botToken := os.Getenv("BOT_TOKEN")
 	if botToken == "" {
 		log.Fatal("BOT_TOKEN is not set in .env file")
@@ -126,7 +119,10 @@ func main() {
 	baseCollector := colly.NewCollector(
 		colly.AllowURLRevisit(),
 	)
-	// Рандомизация заголовков
+	baseCollector.WithTransport(&http.Transport{
+		TLSHandshakeTimeout: 10 * time.Second,
+	})
+
 	userAgents := []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:94.0) Gecko/20100101 Firefox/94.0",
@@ -140,12 +136,14 @@ func main() {
 
 	baseCollector.SetCookieJar(jar)
 	baseCollector.OnRequest(func(r *colly.Request) {
-		// Выбираем случайный User-Agent и Referer
 		r.Headers.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
 		r.Headers.Set("Referer", referers[rand.Intn(len(referers))])
 		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		r.Headers.Set("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
 		r.Headers.Set("Origin", "https://ru.investing.com")
+		r.Headers.Set("Accept-Encoding", "gzip, deflate, br")
+		r.Headers.Set("Upgrade-Insecure-Requests", "1")
+		r.Headers.Set("Connection", "keep-alive")
 		log.Printf("Visiting %s with User-Agent: %s", r.URL.String(), r.Headers.Get("User-Agent"))
 	})
 	baseCollector.OnError(func(r *colly.Response, err error) {
